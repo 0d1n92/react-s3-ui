@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom';
 import { S3Client, ListBucketsCommand, ListObjectsV2Command, CreateBucketCommand, DeleteBucketCommand, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand, CopyObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { HardDrive, Folder, File, Plus, Upload as UploadIcon, FolderUp, Download, Trash2, X, ChevronsRight, ChevronRight, Loader2, Power, AlertTriangle, CheckCircle, Info, Beaker, Save, Server, Trash, Search, RefreshCw, Pencil, Eye, Copy, MoreVertical } from 'lucide-react';
+import { HardDrive, Folder, File, Plus, Upload as UploadIcon, FolderUp, Download, Trash2, X, ChevronsRight, ChevronRight, Loader2, Power, AlertTriangle, CheckCircle, Info, Beaker, Save, Server, Trash, Search, RefreshCw, Pencil, Eye, Copy, MoreVertical, ArrowUp, ArrowDown } from 'lucide-react';
 import { getPreviewType, getPublicUrl, encodeCopySource, getEntriesFromDataTransfer } from './utils/fileUtils';
 import { useFilePreview } from './hooks/useFilePreview';
 import FilePreviewModal from './components/FilePreviewModal';
@@ -137,6 +137,22 @@ const ContextMenu = ({ isOpen, onClose, items }) => {
                 </button>
             ))}
         </div>
+    );
+};
+
+// Clickable column header for the objects table; shows the sort direction
+// arrow on the active column.
+const SortableHeader = ({ label, colKey, sortConfig, onSort }) => {
+    const isActive = sortConfig.key === colKey;
+    return (
+        <button
+            onClick={() => onSort(colKey)}
+            className={`flex items-center space-x-1 font-semibold transition-colors ${isActive ? 'text-sky-300' : 'text-slate-300 hover:text-white'}`}
+            aria-sort={isActive ? (sortConfig.dir === 'asc' ? 'ascending' : 'descending') : undefined}
+        >
+            <span>{label}</span>
+            {isActive && (sortConfig.dir === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />)}
+        </button>
     );
 };
 
@@ -427,7 +443,13 @@ function App() {
     const [objects, setObjects] = useState([]);
     const [isLoadingBuckets, setIsLoadingBuckets] = useState(false);
     const [isLoadingObjects, setIsLoadingObjects] = useState(false);
+    // Continuation token of the current listing (null when fully loaded) and
+    // the loading flag for the "Load more" button.
+    const [listNextToken, setListNextToken] = useState(null);
+    const [isLoadingMore, setIsLoadingMore] = useState(false);
     const [isConnecting, setIsConnecting] = useState(false);
+    // Column sorting for the objects table.
+    const [sortConfig, setSortConfig] = useState({ key: 'name', dir: 'asc' });
     const [uploadingFiles, setUploadingFiles] = useState([]);
     const [selectedItems, setSelectedItems] = useState([]);
     const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -513,6 +535,7 @@ function App() {
         setActiveConnectionId(null);
         setBuckets([]);
         setObjects([]);
+        setListNextToken(null);
         setSelectedItems([]);
         setExpandedNodes({});
         setTreeChildren({});
@@ -532,6 +555,7 @@ function App() {
         setTreeChildren({});
         setLoadingNodes({});
         setObjects([]);
+        setListNextToken(null);
         setSelectedItems([]);
         setSearchQuery('');
         handleConnect({ endpoint: conn.endpoint, publicEndpoint: conn.publicEndpoint, accessKey: conn.accessKey, secretKey: conn.secretKey }, false);
@@ -565,11 +589,15 @@ function App() {
         setIsLoadingObjects(true);
         setSelectedItems([]);
         setSearchQuery("");
+        setListNextToken(null);
         try {
             const command = new ListObjectsV2Command({ Bucket: bucket, Prefix: currentPrefix, Delimiter: '/' });
             const resp = await s3Client.send(command);
             if (seq !== fetchSeqRef.current) return; // stale response, a newer fetch superseded this one
             setObjects(mapListPage(resp, currentPrefix));
+            // ListObjectsV2 returns at most 1000 entries per request: keep the
+            // continuation token so the user can load the remaining pages.
+            setListNextToken(resp.IsTruncated ? resp.NextContinuationToken : null);
         } catch (error) {
             if (seq !== fetchSeqRef.current) return;
             showAlert(`Could not list objects in ${bucket}.`, 'error');
@@ -577,6 +605,24 @@ function App() {
             if (seq === fetchSeqRef.current) setIsLoadingObjects(false);
         }
     }, [s3Client, showAlert]);
+
+    // Fetches the next page of the current listing (see listNextToken above).
+    const loadMoreObjects = useCallback(async () => {
+        if (!s3Client || !selectedBucket || !listNextToken || isLoadingMore) return;
+        const seq = fetchSeqRef.current;
+        setIsLoadingMore(true);
+        try {
+            const command = new ListObjectsV2Command({ Bucket: selectedBucket, Prefix: prefix, Delimiter: '/', ContinuationToken: listNextToken });
+            const resp = await s3Client.send(command);
+            if (seq !== fetchSeqRef.current) return; // navigated away meanwhile
+            setObjects(prev => [...prev, ...mapListPage(resp, prefix)]);
+            setListNextToken(resp.IsTruncated ? resp.NextContinuationToken : null);
+        } catch (error) {
+            if (seq === fetchSeqRef.current) showAlert('Could not load more objects.', 'error');
+        } finally {
+            if (seq === fetchSeqRef.current) setIsLoadingMore(false);
+        }
+    }, [s3Client, selectedBucket, prefix, listNextToken, isLoadingMore, showAlert]);
 
     // --- Sidebar folder tree (Finder-style) ---
     // A node is identified by `${bucket}\u0000${prefix}`; prefix '' is the bucket root.
@@ -1061,6 +1107,22 @@ function App() {
         if (s3Client) fetchObjects(selectedBucket, prefix);
     }, [selectedBucket, prefix, s3Client, fetchObjects]);
 
+    // Escape closes the topmost open layer (preview, modals, context menus).
+    useEffect(() => {
+        const onKeyDown = (e) => {
+            if (e.key !== 'Escape') return;
+            if (previewItem) closePreview();
+            else if (isDeleteModalOpen) setIsDeleteModalOpen(false);
+            else if (treeDeleteTarget) setTreeDeleteTarget(null);
+            else if (isRenameModalOpen) setIsRenameModalOpen(false);
+            else if (isCreateFolderModalOpen) setIsCreateFolderModalOpen(false);
+            else if (openMenuKey) setOpenMenuKey(null);
+            else if (openTreeMenuId) setOpenTreeMenuId(null);
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [previewItem, closePreview, isDeleteModalOpen, treeDeleteTarget, isRenameModalOpen, isCreateFolderModalOpen, openMenuKey, openTreeMenuId]);
+    
     const filteredObjects = useMemo(() => {
         if (!searchQuery) return objects;
         const q = searchQuery.toLowerCase();
@@ -1069,6 +1131,28 @@ function App() {
         // searching "photos" inside "photos/" would match everything).
         return objects.filter(obj => obj.Key.slice(prefix.length).toLowerCase().includes(q));
     }, [objects, searchQuery, prefix]);
+
+    // Sorted view of the filtered objects. Folders always come first; within
+    // each group the active column decides the order.
+    const sortedObjects = useMemo(() => {
+        const dir = sortConfig.dir === 'asc' ? 1 : -1;
+        return [...filteredObjects].sort((a, b) => {
+            if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1;
+            let cmp = 0;
+            switch (sortConfig.key) {
+                case 'size': cmp = (a.Size || 0) - (b.Size || 0); break;
+                case 'modified': cmp = new Date(a.LastModified || 0) - new Date(b.LastModified || 0); break;
+                default: cmp = a.Key.localeCompare(b.Key, undefined, { numeric: true, sensitivity: 'base' });
+            }
+            return cmp * dir;
+        });
+    }, [filteredObjects, sortConfig]);
+
+    const toggleSort = useCallback((key) => {
+        setSortConfig(prev => prev.key === key
+            ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+            : { key, dir: 'asc' });
+    }, []);
 
     // Whether every visible (filtered) row is currently selected.
     const allFilteredSelected = useMemo(() => {
@@ -1243,6 +1327,7 @@ function App() {
                         ) : isLoadingObjects ? (
                             <div className="h-full flex items-center justify-center"><Loader2 className="animate-spin text-slate-500" size={40}/></div>
                         ) : (
+                         <>
                          <table className="w-full text-sm text-left">
                             <thead className="sticky top-0 bg-slate-800/80 backdrop-blur-sm z-10">
                                 <tr>
@@ -1258,14 +1343,14 @@ function App() {
                                             }
                                         }} />
                                     </th>
-                                    <th className="p-3 font-semibold text-slate-300 w-2/5">Name</th>
-                                    <th className="p-3 font-semibold text-slate-300">Size</th>
-                                    <th className="p-3 font-semibold text-slate-300">Last Modified</th>
+                                    <th className="p-3 w-2/5"><SortableHeader label="Name" colKey="name" sortConfig={sortConfig} onSort={toggleSort} /></th>
+                                    <th className="p-3"><SortableHeader label="Size" colKey="size" sortConfig={sortConfig} onSort={toggleSort} /></th>
+                                    <th className="p-3"><SortableHeader label="Last Modified" colKey="modified" sortConfig={sortConfig} onSort={toggleSort} /></th>
                                     <th className="p-3 font-semibold text-slate-300 text-right">Actions</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800">
-                                {filteredObjects.map(obj => (
+                                {sortedObjects.map(obj => (
                                     <tr
                                         key={obj.Key}
                                         draggable
@@ -1338,8 +1423,31 @@ function App() {
                                 ))}
                             </tbody>
                          </table>
+                         {listNextToken && (
+                            <div className="p-4 flex justify-center">
+                                <button
+                                    onClick={loadMoreObjects}
+                                    disabled={isLoadingMore}
+                                    className="flex items-center space-x-2 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-800 disabled:cursor-not-allowed text-slate-200 font-semibold py-2 px-4 rounded-md transition-colors"
+                                >
+                                    {isLoadingMore && <Loader2 className="animate-spin h-4 w-4" />}
+                                    <span>{isLoadingMore ? 'Loading…' : 'Load more'}</span>
+                                </button>
+                            </div>
+                         )}
+                         </>
                          )}
                      </div>
+                     {selectedBucket && !isLoadingObjects && (
+                        <div className="flex-shrink-0 px-4 py-1.5 bg-slate-800/30 border-t border-slate-700 text-xs text-slate-500 flex items-center justify-between">
+                            <span>
+                                {filteredObjects.filter(o => o.isFolder).length} folder(s), {filteredObjects.filter(o => !o.isFolder).length} file(s)
+                                {searchQuery ? ` matching "${searchQuery}"` : ''}
+                                {listNextToken ? ' — more available' : ''}
+                            </span>
+                            {selectedItems.length > 0 && <span className="text-sky-400">{selectedItems.length} selected</span>}
+                        </div>
+                     )}
                 </main>
             </div>
             <Modal isOpen={isRenameModalOpen} onClose={() => setIsRenameModalOpen(false)} title="Rename">
