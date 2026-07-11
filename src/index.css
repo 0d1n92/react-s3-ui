@@ -14,8 +14,10 @@
     90% { transform: translateX(4px); }
 }
 
-.form-flash {
+/* `div.form-flash` raises specificity above Tailwind's single-class
+   `border-slate-700` utility so the glow wins without needing !important. */
+div.form-flash {
     animation: form-shake 0.55s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
-    border-color: #38e8ff !important;
+    border-color: #38e8ff;
     box-shadow: 0 0 0 2px rgba(56, 232, 255, 0.75), 0 0 28px rgba(56, 189, 248, 0.7);
 }

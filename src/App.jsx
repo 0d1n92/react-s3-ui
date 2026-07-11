@@ -7,6 +7,23 @@ import { getPreviewType, getPublicUrl, encodeCopySource, getEntriesFromDataTrans
 import { useFilePreview } from './hooks/useFilePreview';
 import FilePreviewModal from './components/FilePreviewModal';
 
+// Max number of files uploaded in parallel (keeps the UI responsive without
+// overwhelming the browser's connection pool).
+const UPLOAD_CONCURRENCY = 4;
+
+// Delimiter used to build a tree node id from `bucket` + `prefix`. The NUL
+// character (\u0000) is not allowed in S3 bucket names, so it can never appear
+// inside either part and is safe to split on.
+const NODE_ID_SEP = '\u0000';
+
+// How long to wait before running a coalesced tree refresh, so a burst of
+// mutations (e.g. a multi-file upload completing) triggers a single refresh pass.
+const TREE_REFRESH_DEBOUNCE_MS = 300;
+
+// Monotonic counter guaranteeing unique upload ids even for files queued within
+// the same millisecond.
+let uploadIdSeq = 0;
+
 // --- Custom Hooks ---
 
 // Hook to sync state with localStorage
@@ -125,8 +142,10 @@ const ContextMenu = ({ isOpen, onClose, items }) => {
 
 // Recursive Finder-style tree node for the sidebar. Buckets are roots (prefix
 // ''); folders are nested nodes. All shared state/handlers come through `ctx`.
-const TreeNode = ({ ctx, bucket, nodePrefix, label, depth, isBucket }) => {
-    const id = `${bucket}\u0000${nodePrefix}`;
+// Memoized so a sibling's state change doesn't re-render the whole subtree; this
+// relies on `ctx` being a stable (memoized) reference — see treeCtx in App.
+const TreeNode = React.memo(({ ctx, bucket, nodePrefix, label, depth, isBucket }) => {
+    const id = `${bucket}${NODE_ID_SEP}${nodePrefix}`;
     const isExpanded = !!ctx.expandedNodes[id];
     const isLoading = !!ctx.loadingNodes[id];
     const children = ctx.treeChildren[id];
@@ -191,7 +210,7 @@ const TreeNode = ({ ctx, bucket, nodePrefix, label, depth, isBucket }) => {
             )}
         </li>
     );
-};
+});
 
 // --- Main Application Components ---
 
@@ -430,6 +449,11 @@ function App() {
     const dragCounter = useRef(0);
     const treeChildrenRef = useRef({});
     const loadingNodesRef = useRef({});
+    // Tracks nodes with an in-flight fetch so overlapping loadNode calls (e.g. a
+    // forced refresh firing while a load is still pending) don't double-fetch.
+    const inFlightNodesRef = useRef({});
+    // Timer handle for the debounced tree refresh (see refreshTree).
+    const refreshTimerRef = useRef(null);
     const [searchQuery, setSearchQuery] = useState("");
     const [savedConnections, setSavedConnections] = useLocalStorage('minio-connections', []);
     const [connectionEndpoint, setConnectionEndpoint] = useState(null);
@@ -488,7 +512,8 @@ function App() {
         setLoadingNodes({});
         setSearchQuery('');
         setSearchParams({});
-    }, [setSearchParams]);
+        showAlert('Disconnected.', 'info');
+    }, [setSearchParams, showAlert]);
 
     // Quickly switch to another saved connection from the header.
     const handleSwitchConnection = useCallback((id) => {
@@ -537,18 +562,23 @@ function App() {
     }, [s3Client, showAlert]);
 
     // --- Sidebar folder tree (Finder-style) ---
-    // A node is identified by `${bucket} ${prefix}`; prefix '' is the bucket root.
+    // A node is identified by `${bucket}\u0000${prefix}`; prefix '' is the bucket root.
     // We keep refs mirroring the children/loading state so loadNode can read the
     // latest values synchronously without re-creating itself on every change.
     useEffect(() => { treeChildrenRef.current = treeChildren; }, [treeChildren]);
     useEffect(() => { loadingNodesRef.current = loadingNodes; }, [loadingNodes]);
 
-    const nodeId = (bucket, nodePrefix) => `${bucket}\u0000${nodePrefix}`;
+    const nodeId = (bucket, nodePrefix) => `${bucket}${NODE_ID_SEP}${nodePrefix}`;
 
     const loadNode = useCallback(async (bucket, nodePrefix, force = false) => {
         if (!s3Client) return;
         const id = nodeId(bucket, nodePrefix);
-        if (!force && (treeChildrenRef.current[id] || loadingNodesRef.current[id])) return;
+        // Skip if a fetch for this node is already in flight (guards forced
+        // refreshes that overlap a pending load); non-forced calls also skip
+        // when children are already cached.
+        if (inFlightNodesRef.current[id]) return;
+        if (!force && treeChildrenRef.current[id]) return;
+        inFlightNodesRef.current[id] = true;
         loadingNodesRef.current[id] = true;
         setLoadingNodes(prev => ({ ...prev, [id]: true }));
         try {
@@ -558,6 +588,8 @@ function App() {
         } catch (error) {
             setTreeChildren(prev => ({ ...prev, [id]: [] }));
         } finally {
+            delete inFlightNodesRef.current[id];
+            delete loadingNodesRef.current[id];
             setLoadingNodes(prev => { const n = { ...prev }; delete n[id]; return n; });
         }
     }, [s3Client]);
@@ -578,13 +610,22 @@ function App() {
 
     // Re-fetches children for every currently expanded node so the tree stays in
     // sync after a mutation (move, rename, delete, create folder, upload).
+    // Debounced so a burst of mutations (e.g. a multi-file upload completing)
+    // coalesces into a single refresh pass instead of N parallel list calls.
     const refreshTree = useCallback(() => {
-        Object.keys(expandedNodes).forEach(id => {
-            if (!expandedNodes[id]) return;
-            const sep = id.indexOf('\u0000');
-            loadNode(id.slice(0, sep), id.slice(sep + 1), true);
-        });
+        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = setTimeout(() => {
+            refreshTimerRef.current = null;
+            Object.keys(expandedNodes).forEach(id => {
+                if (!expandedNodes[id]) return;
+                const sep = id.indexOf(NODE_ID_SEP);
+                loadNode(id.slice(0, sep), id.slice(sep + 1), true);
+            });
+        }, TREE_REFRESH_DEBOUNCE_MS);
     }, [expandedNodes, loadNode]);
+
+    // Clear any pending debounced refresh on unmount.
+    useEffect(() => () => { if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current); }, []);
 
     // Auto-expand the tree along the path of the bucket/prefix currently in view.
     useEffect(() => {
@@ -608,7 +649,7 @@ function App() {
 
         const queue = entries
             .filter(e => e.file && e.path)
-            .map((e, i) => ({ ...e, id: `${e.path}-${Date.now()}-${i}` }));
+            .map((e) => ({ ...e, id: `${e.path}-${uploadIdSeq++}` }));
         if (!queue.length) return;
 
         setUploadingFiles(prev => [...prev, ...queue.map(q => ({ id: q.id, name: q.path, progress: 0 }))]);
@@ -637,14 +678,13 @@ function App() {
         };
 
         // Upload with a small concurrency pool to keep the UI responsive.
-        const CONCURRENCY = 4;
         let next = 0;
         const worker = async () => {
             while (next < queue.length) {
                 await uploadOne(queue[next++]);
             }
         };
-        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
+        await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));
 
         if (successCount) showAlert(`${successCount} file(s) uploaded successfully.`, 'success');
         if (failCount) showAlert(`${failCount} file(s) failed to upload.`, 'error');
@@ -883,6 +923,8 @@ function App() {
         const external = isFileDrag(e);
         if (!external && !draggedKeyRef.current) return;
         e.preventDefault();
+        // Stop the drop from also bubbling to the main-area drop handler, which
+        // would upload/move the item into the current view instead of this node.
         e.stopPropagation();
         setTreeDropTarget(null);
         if (external) {
@@ -1000,14 +1042,17 @@ function App() {
         if (!searchQuery) return objects;
         return objects.filter(obj => obj.Key.toLowerCase().includes(searchQuery.toLowerCase()));
     }, [objects, searchQuery]);
-    
-    if (!s3Client) {
-        return <ConnectionManager onConnect={handleConnect} isConnecting={false} showAlert={showAlert} />;
-    }
-    
-    const breadcrumbs = ['Buckets', selectedBucket, ...prefix.split('/').filter(Boolean)];
 
-    const treeCtx = {
+    // Stable handlers for the tree context so treeCtx (and thus every TreeNode)
+    // isn't invalidated on every render.
+    const handleTreeMenuToggle = useCallback((id) => setOpenTreeMenuId(prev => prev === id ? null : id), []);
+    const handleTreeMenuClose = useCallback(() => setOpenTreeMenuId(null), []);
+    const handleTreeDeleteRequest = useCallback((bucket, nodePrefix, name) => setTreeDeleteTarget({ bucket, prefix: nodePrefix, name }), []);
+
+    // Memoized so its identity is stable across renders; combined with
+    // React.memo on TreeNode this prevents re-rendering the whole tree when
+    // unrelated App state changes.
+    const treeCtx = useMemo(() => ({
         selectedBucket,
         currentPrefix: prefix,
         expandedNodes,
@@ -1020,11 +1065,21 @@ function App() {
         onNodeDragOver: handleNodeDragOver,
         onNodeDragLeave: handleNodeDragLeave,
         onNodeDrop: handleNodeDrop,
-        onMenuToggle: (id) => setOpenTreeMenuId(prev => prev === id ? null : id),
-        onMenuClose: () => setOpenTreeMenuId(null),
+        onMenuToggle: handleTreeMenuToggle,
+        onMenuClose: handleTreeMenuClose,
         onCopyUrl: handleCopyNodeUrl,
-        onDelete: (bucket, nodePrefix, name) => setTreeDeleteTarget({ bucket, prefix: nodePrefix, name }),
-    };
+        onDelete: handleTreeDeleteRequest,
+    }), [
+        selectedBucket, prefix, expandedNodes, treeChildren, loadingNodes, treeDropTarget, openTreeMenuId,
+        toggleNode, navigateTo, handleNodeDragOver, handleNodeDragLeave, handleNodeDrop,
+        handleTreeMenuToggle, handleTreeMenuClose, handleCopyNodeUrl, handleTreeDeleteRequest,
+    ]);
+
+    if (!s3Client) {
+        return <ConnectionManager onConnect={handleConnect} isConnecting={false} showAlert={showAlert} />;
+    }
+
+    const breadcrumbs = ['Buckets', selectedBucket, ...prefix.split('/').filter(Boolean)];
 
     return (
         <div className="h-screen w-screen bg-slate-900 text-slate-300 flex flex-col font-sans overflow-hidden">

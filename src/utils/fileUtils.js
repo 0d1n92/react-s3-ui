@@ -73,9 +73,17 @@ export function encodeCopySource(bucket, key) {
     return `${encodeURIComponent(bucket)}/${encodeS3Key(key)}`;
 }
 
+// Safety limits for traversing dropped directory trees. They guard against
+// pathologically deep/large structures (or a misbehaving reader implementation)
+// that would otherwise blow the stack or loop forever, freezing the browser tab.
+const MAX_TREE_DEPTH = 50;
+const MAX_DIR_ENTRIES = 100000;
+
 /**
  * Reads every child FileSystemEntry of a directory reader. The reader returns
  * entries in batches, so it must be drained until it yields an empty batch.
+ * A hard cap on the total number of entries prevents an infinite loop if the
+ * reader never yields an empty batch.
  * @param {FileSystemDirectoryReader} reader
  * @returns {Promise<FileSystemEntry[]>}
  */
@@ -87,6 +95,14 @@ function readAllDirEntries(reader) {
                 if (batch.length === 0) resolve(all);
                 else {
                     all.push(...batch);
+                    if (all.length > MAX_DIR_ENTRIES) {
+                        console.warn(
+                            `readAllDirEntries: reached the ${MAX_DIR_ENTRIES}-entry cap; ` +
+                            `remaining entries in this directory are ignored.`
+                        );
+                        resolve(all);
+                        return;
+                    }
                     readBatch();
                 }
             }, reject);
@@ -101,17 +117,25 @@ function readAllDirEntries(reader) {
  * (preserving folder structure for directory drops).
  * @param {FileSystemEntry} entry
  * @param {string} basePath - accumulated parent path (with trailing slash)
+ * @param {number} depth - current recursion depth (guards against deep trees)
  * @returns {Promise<Array<{ file: File, path: string }>>}
  */
-export async function readEntryRecursive(entry, basePath = '') {
+export async function readEntryRecursive(entry, basePath = '', depth = 0) {
     if (entry.isFile) {
         const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
         return [{ file, path: `${basePath}${file.name}` }];
     }
     if (entry.isDirectory) {
+        if (depth >= MAX_TREE_DEPTH) {
+            console.warn(
+                `readEntryRecursive: reached the ${MAX_TREE_DEPTH}-level depth cap at ` +
+                `"${basePath}${entry.name}/"; deeper contents are ignored.`
+            );
+            return [];
+        }
         const childEntries = await readAllDirEntries(entry.createReader());
         const results = await Promise.all(
-            childEntries.map((child) => readEntryRecursive(child, `${basePath}${entry.name}/`))
+            childEntries.map((child) => readEntryRecursive(child, `${basePath}${entry.name}/`, depth + 1))
         );
         return results.flat();
     }
