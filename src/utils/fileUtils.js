@@ -50,7 +50,9 @@ export function getMimeType(key) {
  * @returns {string}
  */
 export function getPublicUrl(endpoint, bucket, key) {
-    return `${endpoint.replace(/\/$/, '')}/${bucket}/${key}`;
+    // Encode the key (preserving slashes) so URLs stay valid for keys
+    // containing spaces, unicode, or reserved characters.
+    return `${endpoint.replace(/\/$/, '')}/${bucket}/${encodeS3Key(key)}`;
 }
 
 /**

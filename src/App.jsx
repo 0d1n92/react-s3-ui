@@ -427,6 +427,7 @@ function App() {
     const [objects, setObjects] = useState([]);
     const [isLoadingBuckets, setIsLoadingBuckets] = useState(false);
     const [isLoadingObjects, setIsLoadingObjects] = useState(false);
+    const [isConnecting, setIsConnecting] = useState(false);
     const [uploadingFiles, setUploadingFiles] = useState([]);
     const [selectedItems, setSelectedItems] = useState([]);
     const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -454,6 +455,9 @@ function App() {
     const inFlightNodesRef = useRef({});
     // Timer handle for the debounced tree refresh (see refreshTree).
     const refreshTimerRef = useRef(null);
+    // Monotonic id of the latest fetchObjects call, used to discard stale
+    // responses when the user navigates while a listing is still in flight.
+    const fetchSeqRef = useRef(0);
     const [searchQuery, setSearchQuery] = useState("");
     const [savedConnections, setSavedConnections] = useLocalStorage('minio-connections', []);
     const [connectionEndpoint, setConnectionEndpoint] = useState(null);
@@ -463,6 +467,7 @@ function App() {
     const { alertData, showAlert, hideAlert } = useAlert();
 
     const handleConnect = useCallback(async (connectionDetails, saveConfig) => {
+        setIsConnecting(true);
         try {
             const client = new S3Client({
                 endpoint: connectionDetails.endpoint,
@@ -496,6 +501,8 @@ function App() {
             setActiveConnectionId(match ? match.id : null);
         } catch (error) {
             showAlert(`Connection failed: ${error.name}.`, 'error');
+        } finally {
+            setIsConnecting(false);
         }
     }, [savedConnections, setSavedConnections, showAlert]);
 
@@ -543,21 +550,31 @@ function App() {
         }
     }, [s3Client, showAlert]);
 
+    // Maps a ListObjectsV2 response page into the flat objects array shape.
+    const mapListPage = (resp, currentPrefix) => {
+        const folders = (resp.CommonPrefixes || []).map(p => ({ Key: p.Prefix, isFolder: true }));
+        const files = (resp.Contents || []).filter(c => c.Key !== currentPrefix).map(c => ({ ...c, isFolder: false }));
+        return [...folders, ...files];
+    };
+
     const fetchObjects = useCallback(async (bucket, currentPrefix) => {
         if (!s3Client || !bucket) return;
+        // Monotonic sequence guards against a slow response from a previous
+        // navigation overwriting the listing of the folder currently in view.
+        const seq = ++fetchSeqRef.current;
         setIsLoadingObjects(true);
         setSelectedItems([]);
         setSearchQuery("");
         try {
             const command = new ListObjectsV2Command({ Bucket: bucket, Prefix: currentPrefix, Delimiter: '/' });
-            const { Contents, CommonPrefixes } = await s3Client.send(command);
-            const folders = (CommonPrefixes || []).map(p => ({ Key: p.Prefix, isFolder: true }));
-            const files = (Contents || []).filter(c => c.Key !== currentPrefix).map(c => ({ ...c, isFolder: false }));
-            setObjects([...folders, ...files]);
+            const resp = await s3Client.send(command);
+            if (seq !== fetchSeqRef.current) return; // stale response, a newer fetch superseded this one
+            setObjects(mapListPage(resp, currentPrefix));
         } catch (error) {
+            if (seq !== fetchSeqRef.current) return;
             showAlert(`Could not list objects in ${bucket}.`, 'error');
         } finally {
-            setIsLoadingObjects(false);
+            if (seq === fetchSeqRef.current) setIsLoadingObjects(false);
         }
     }, [s3Client, showAlert]);
 
@@ -582,8 +599,15 @@ function App() {
         loadingNodesRef.current[id] = true;
         setLoadingNodes(prev => ({ ...prev, [id]: true }));
         try {
-            const resp = await s3Client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: nodePrefix, Delimiter: '/' }));
-            const folders = (resp.CommonPrefixes || []).map(p => ({ key: p.Prefix, name: p.Prefix.slice(nodePrefix.length).replace(/\/$/, '') }));
+            // Drain all pages: with many files under a node the child folders
+            // (CommonPrefixes) can span multiple 1000-entry ListObjectsV2 pages.
+            const folders = [];
+            let continuationToken;
+            do {
+                const resp = await s3Client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: nodePrefix, Delimiter: '/', ContinuationToken: continuationToken }));
+                (resp.CommonPrefixes || []).forEach(p => folders.push({ key: p.Prefix, name: p.Prefix.slice(nodePrefix.length).replace(/\/$/, '') }));
+                continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+            } while (continuationToken);
             setTreeChildren(prev => ({ ...prev, [id]: folders }));
         } catch (error) {
             setTreeChildren(prev => ({ ...prev, [id]: [] }));
@@ -616,6 +640,13 @@ function App() {
         if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = setTimeout(() => {
             refreshTimerRef.current = null;
+            // Drop the cached children of collapsed nodes so re-expanding them
+            // refetches instead of showing a pre-mutation (stale) snapshot.
+            setTreeChildren(prev => {
+                const next = {};
+                Object.keys(prev).forEach(id => { if (expandedNodes[id]) next[id] = prev[id]; });
+                return next;
+            });
             Object.keys(expandedNodes).forEach(id => {
                 if (!expandedNodes[id]) return;
                 const sep = id.indexOf(NODE_ID_SEP);
@@ -752,36 +783,23 @@ function App() {
     const handleDeleteSelected = async () => {
         if (!s3Client || !selectedBucket || selectedItems.length === 0) return;
 
-        let allKeysToDelete = [];
-        const getAllKeysInPrefix = async (prefixToDelete) => {
-            let keys = [];
-            let continuationToken;
-            do {
-                const command = new ListObjectsV2Command({ Bucket: selectedBucket, Prefix: prefixToDelete, ContinuationToken: continuationToken });
-                const response = await s3Client.send(command);
-                if (response.Contents) keys.push(...response.Contents.map(item => item.Key));
-                continuationToken = response.NextContinuationToken;
-            } while (continuationToken);
-            return keys;
-        };
-
-        for (const key of selectedItems) {
-            if (key.endsWith('/')) { // Folder
-                allKeysToDelete.push(...await getAllKeysInPrefix(key));
-            } else { // File
-                allKeysToDelete.push(key);
-            }
-        }
-        
-        allKeysToDelete = [...new Set(allKeysToDelete)];
-        if (allKeysToDelete.length === 0) {
-            setIsDeleteModalOpen(false);
-            return;
-        }
-
+        // The whole expansion runs inside the try: a listing failure while
+        // resolving folder contents must surface as an alert, not as an
+        // unhandled rejection that leaves the modal open.
         try {
-            await batchDeleteKeys(allKeysToDelete);
-            showAlert(`${allKeysToDelete.length} item(s) deleted successfully.`, 'success');
+            let allKeysToDelete = [];
+            for (const key of selectedItems) {
+                if (key.endsWith('/')) { // Folder
+                    allKeysToDelete.push(...await collectAllKeysInPrefix(key));
+                } else { // File
+                    allKeysToDelete.push(key);
+                }
+            }
+            allKeysToDelete = [...new Set(allKeysToDelete)];
+            if (allKeysToDelete.length > 0) {
+                await batchDeleteKeys(allKeysToDelete);
+                showAlert(`${allKeysToDelete.length} item(s) deleted successfully.`, 'success');
+            }
         } catch (error) {
             showAlert('Failed to delete items.', 'error');
         } finally {
@@ -815,11 +833,14 @@ function App() {
     }, [s3Client, selectedBucket]);
 
     const handleDeleteItem = useCallback(async (key, isFolder) => {
-        const keysToDelete = isFolder ? await collectAllKeysInPrefix(key) : [key];
-        if (keysToDelete.length === 0) { fetchObjects(selectedBucket, prefix); return; }
         try {
-            await batchDeleteKeys(keysToDelete);
-            showAlert('Deleted successfully.', 'success');
+            // Resolve the folder's contents inside the try so a listing failure
+            // shows an alert instead of surfacing as an unhandled rejection.
+            const keysToDelete = isFolder ? await collectAllKeysInPrefix(key) : [key];
+            if (keysToDelete.length > 0) {
+                await batchDeleteKeys(keysToDelete);
+                showAlert('Deleted successfully.', 'success');
+            }
         } catch (error) {
             showAlert('Failed to delete.', 'error');
         } finally {
@@ -829,7 +850,9 @@ function App() {
     }, [selectedBucket, prefix, collectAllKeysInPrefix, batchDeleteKeys, showAlert, fetchObjects, refreshTree]);
 
     const openRenameModal = useCallback((obj) => {
-        const currentName = obj.Key.replace(prefix, '').replace(/\/$/, '');
+        // slice(prefix.length) rather than replace(): keys always start with the
+        // prefix, and replace() would also strip a later occurrence when prefix is ''.
+        const currentName = obj.Key.slice(prefix.length).replace(/\/$/, '');
         setRenameTarget(obj);
         setRenameValue(currentName);
         setIsRenameModalOpen(true);
@@ -1037,11 +1060,22 @@ function App() {
     useEffect(() => {
         if (s3Client) fetchObjects(selectedBucket, prefix);
     }, [selectedBucket, prefix, s3Client, fetchObjects]);
-    
+
     const filteredObjects = useMemo(() => {
         if (!searchQuery) return objects;
-        return objects.filter(obj => obj.Key.toLowerCase().includes(searchQuery.toLowerCase()));
-    }, [objects, searchQuery]);
+        const q = searchQuery.toLowerCase();
+        // Match against the name relative to the current prefix; matching the
+        // full key would trivially match the shared path of every row (e.g.
+        // searching "photos" inside "photos/" would match everything).
+        return objects.filter(obj => obj.Key.slice(prefix.length).toLowerCase().includes(q));
+    }, [objects, searchQuery, prefix]);
+
+    // Whether every visible (filtered) row is currently selected.
+    const allFilteredSelected = useMemo(() => {
+        if (filteredObjects.length === 0) return false;
+        const selected = new Set(selectedItems);
+        return filteredObjects.every(o => selected.has(o.Key));
+    }, [filteredObjects, selectedItems]);
 
     // Stable handlers for the tree context so treeCtx (and thus every TreeNode)
     // isn't invalidated on every render.
@@ -1076,7 +1110,7 @@ function App() {
     ]);
 
     if (!s3Client) {
-        return <ConnectionManager onConnect={handleConnect} isConnecting={false} showAlert={showAlert} />;
+        return <ConnectionManager onConnect={handleConnect} isConnecting={isConnecting} showAlert={showAlert} />;
     }
 
     const breadcrumbs = ['Buckets', selectedBucket, ...prefix.split('/').filter(Boolean)];
@@ -1213,9 +1247,15 @@ function App() {
                             <thead className="sticky top-0 bg-slate-800/80 backdrop-blur-sm z-10">
                                 <tr>
                                     <th className="p-3 w-12 text-center">
-                                        <input type="checkbox" className="bg-slate-700 border-slate-500 rounded" checked={filteredObjects.length > 0 && selectedItems.length === filteredObjects.length} onChange={() => {
-                                            if (selectedItems.length === filteredObjects.length) setSelectedItems([]);
-                                            else setSelectedItems(filteredObjects.map(o => o.Key));
+                                        <input type="checkbox" className="bg-slate-700 border-slate-500 rounded" checked={allFilteredSelected} onChange={() => {
+                                            // Toggle only the visible (filtered) rows, so a select-all
+                                            // during a search doesn't touch hidden selections.
+                                            if (allFilteredSelected) {
+                                                const visible = new Set(filteredObjects.map(o => o.Key));
+                                                setSelectedItems(prev => prev.filter(k => !visible.has(k)));
+                                            } else {
+                                                setSelectedItems(prev => [...new Set([...prev, ...filteredObjects.map(o => o.Key)])]);
+                                            }
                                         }} />
                                     </th>
                                     <th className="p-3 font-semibold text-slate-300 w-2/5">Name</th>
@@ -1268,7 +1308,7 @@ function App() {
                                         <td className="p-3">
                                             <button className="flex items-center space-x-2 group w-full text-left" onClick={() => { if(obj.isFolder) setSearchParams({ bucket: selectedBucket, prefix: obj.Key }); }}>
                                                 {obj.isFolder ? <Folder className="text-sky-400" size={20} /> : <File className="text-slate-500" size={20} />}
-                                                <span className={`${obj.isFolder ? 'text-slate-100 group-hover:text-sky-300 cursor-pointer' : 'text-slate-300 cursor-default'} truncate`}>{obj.Key.replace(prefix, '')}</span>
+                                                <span className={`${obj.isFolder ? 'text-slate-100 group-hover:text-sky-300 cursor-pointer' : 'text-slate-300 cursor-default'} truncate`}>{obj.Key.slice(prefix.length)}</span>
                                             </button>
                                         </td>
                                         <td className="p-3 text-slate-400">{!obj.isFolder && formatBytes(obj.Size)}</td>
