@@ -1,0 +1,10 @@
+services:
+  react-s3-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: minio-explorer-ui:latest
+    container_name: react-s3-ui
+    ports:
+      - "6001:80"
+    restart: unless-stopped
